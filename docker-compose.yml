@@ -1,0 +1,25 @@
+version: '2.4'
+
+services:
+  app:
+    image: &app async-buses-on-map
+    mem_limit: 500M
+    build:
+      context: ./
+      dockerfile: Dockerfile
+    command: python server.py
+    ports:
+    - "8000:8000"
+    - "8080:8080"
+    volumes:
+      - ./:/app
+    restart: always
+
+  fake_bus:
+    image: *app
+    mem_limit: 200M
+    command: python fake_bus.py
+    volumes:
+      - ./:/app
+    environment:
+      SERVER_URL: 'ws://app:8080'
