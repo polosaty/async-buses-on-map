@@ -7,7 +7,7 @@ services:
     build:
       context: ./
       dockerfile: Dockerfile
-    command: python server.py
+    command: python server.py -vvv
     ports:
     - "8000:8000"
     - "8080:8080"
@@ -18,8 +18,11 @@ services:
   fake_bus:
     image: *app
     mem_limit: 200M
-    command: python fake_bus.py
+    command: python fake_bus.py -vvv --refresh_timeout=1
     volumes:
       - ./:/app
     environment:
       SERVER_URL: 'ws://app:8080'
+      ROUTES_NUMBER: 600
+      BUSES_PER_ROUTE: 20
+      WEBSOCKETS_NUMBER: 10
