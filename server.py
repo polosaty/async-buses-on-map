@@ -13,6 +13,8 @@ from trio_websocket import serve_websocket
 from trio_websocket import WebSocketConnection
 from trio_websocket import WebSocketRequest
 
+from utils import async_suppress
+
 logger = logging.getLogger('server')
 BUSES = {}
 
@@ -21,6 +23,14 @@ class WebsocketMessageParseError(Exception):
     def __init__(self, error, *args):
         self.error = error
         super().__init__(*args)
+
+
+@contextlib.asynccontextmanager
+async def notify_client_about_message_format_error(ws: WebSocketConnection):
+    try:
+        yield
+    except WebsocketMessageParseError as ex:
+        await ws.send_message(json.dumps({"errors": [ex.error], "msgType": "Errors"}))
 
 
 @dataclass
@@ -44,7 +54,7 @@ class WindowBounds:
                 self.south_lat <= bus.lat <= self.north_lat
                 and self.west_lng <= bus.lng <= self.east_lng
             )
-        except Exception as ex:
+        except TypeError as ex:
             logger.exception('WindowBounds.is_inside %r', ex)
 
         return False
@@ -52,20 +62,29 @@ class WindowBounds:
     def is_real(self):
         return self.south_lat < self.north_lat and self.west_lng < self.east_lng
 
-    def update(self, south_lat, north_lat, west_lng, east_lng):
-        self.south_lat = south_lat
-        self.north_lat = north_lat
-        self.west_lng = west_lng
-        self.east_lng = east_lng
+    @staticmethod
+    def validate_new_bounds(*, south_lat, north_lat, west_lng, east_lng):
+        args = [south_lat, north_lat, west_lng, east_lng]
+        assert all(map(lambda arg: isinstance(arg, (float, int)), args))
+        assert WindowBounds(*args).is_real()
+
+    def update(self, *, south_lat, north_lat, west_lng, east_lng):
+        self.__init__(
+            south_lat=south_lat,
+            north_lat=north_lat,
+            west_lng=west_lng,
+            east_lng=east_lng
+        )
 
 
+@async_suppress(ConnectionClosed)
 async def serve_outcome(request: WebSocketRequest):
     ws: WebSocketConnection = await request.accept()
     bounds = WindowBounds()
-    with contextlib.suppress(ConnectionClosed):
-        async with trio.open_nursery() as nursery:
-            nursery.start_soon(listen_browser, ws, bounds)
-            nursery.start_soon(talk_to_browser, ws, bounds)
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(listen_browser, ws, bounds)
+        nursery.start_soon(talk_to_browser, ws, bounds)
 
 
 async def talk_to_browser(ws: WebSocketConnection, bounds: WindowBounds):
@@ -88,8 +107,12 @@ async def talk_to_browser(ws: WebSocketConnection, bounds: WindowBounds):
 async def listen_browser(ws: WebSocketConnection, bounds: WindowBounds):
     """Update bounds by newBounds from ws."""
     while True:
-        try:
-            message = json.loads(await ws.get_message())
+        async with notify_client_about_message_format_error(ws):
+            try:
+                message = json.loads(await ws.get_message())
+            except json.JSONDecodeError as ex:
+                logger.warning('%r', ex)
+                raise WebsocketMessageParseError('Requires valid JSON')
 
             if not message.get("msgType"):
                 logger.warning('msgType not in message: %r', message)
@@ -100,27 +123,26 @@ async def listen_browser(ws: WebSocketConnection, bounds: WindowBounds):
                 #  {"msgType":"newBounds",
                 #   "data":{"south_lat":55.7256116937982,"north_lat":55.77435239625299,
                 #           "west_lng":37.54019737243653,"east_lng":37.65984535217286}}
-                bounds.update(**message['data'])
+                try:
+                    bounds.validate_new_bounds(**message['data'])
+                    bounds.update(**message['data'])
+                except (TypeError, AssertionError):
+                    raise WebsocketMessageParseError("Wrong format of newBounds message")
 
             logger.debug('%r', message)
 
-        except json.JSONDecodeError as ex:
-            logger.warning('%r', ex)
-            await ws.send_message(json.dumps({"errors": ['Requires valid JSON'], "msgType": "Errors"}))
 
-        except WebsocketMessageParseError as ex:
-            await ws.send_message(json.dumps({"errors": [ex.error], "msgType": "Errors"}))
-
-        except ConnectionClosed:
-            break
-
-
+@async_suppress(ConnectionClosed)
 async def serve_income(request: WebSocketRequest):
     ws: WebSocketConnection = await request.accept()
 
     while True:
-        try:
-            bus_data = json.loads(await ws.get_message())
+        async with notify_client_about_message_format_error(ws):
+            try:
+                bus_data = json.loads(await ws.get_message())
+            except json.JSONDecodeError as ex:
+                logger.warning('%r', ex)
+                raise WebsocketMessageParseError('Requires valid JSON')
 
             try:
                 bus = Bus(**bus_data)
@@ -130,16 +152,6 @@ async def serve_income(request: WebSocketRequest):
 
             BUSES[bus.busId] = bus
             logger.debug('%r', asdict(bus))
-
-        except json.JSONDecodeError as ex:
-            logger.warning('%r', ex)
-            await ws.send_message(json.dumps({"errors": ['Requires valid JSON'], "msgType": "Errors"}))
-
-        except WebsocketMessageParseError as ex:
-            await ws.send_message(json.dumps({"errors": [ex.error], "msgType": "Errors"}))
-
-        except ConnectionClosed:
-            break
 
 
 @click.command()
@@ -164,5 +176,5 @@ async def main(browser_port, bus_port, verbose):
 
 
 if __name__ == '__main__':
-    with contextlib.suppress(KeyboardInterrupt):
+    with contextlib.suppress(KeyboardInterrupt, ConnectionClosed):
         main(_anyio_backend="trio")

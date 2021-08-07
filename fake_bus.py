@@ -13,44 +13,46 @@ import trio
 import trio_websocket
 from trio_websocket import open_websocket_url
 
+from utils import async_suppress
+
 logger = logging.getLogger('fake_bus')
 
 
 def relaunch_on_disconnect(async_function):
+
+    @async_suppress(trio.Cancelled)
     async def wrapped(*args, **kwargs):
         while True:
             try:
                 logger.debug("%r starting", async_function.__name__)
                 await async_function(*args, **kwargs)
-            except trio.Cancelled:
-                break
-            except (trio_websocket.ConnectionClosed, Exception) as ex:
+            except (trio_websocket.ConnectionClosed, trio_websocket.HandshakeError) as ex:
                 logger.error('%r %r', async_function.__name__, ex)
                 await trio.sleep(1)
 
     return wrapped
 
 
-async def consume_and_send(url, messages_channel: trio.MemoryReceiveChannel):
-    async with messages_channel:
-        await connect_and_send(url, messages_channel)
+async def consume_and_send(url, message_channel: trio.MemoryReceiveChannel):
+    async with message_channel:
+        await connect_and_send(url, message_channel)
 
 
 @relaunch_on_disconnect
-async def connect_and_send(url, messages_channel: trio.MemoryReceiveChannel):
+async def connect_and_send(url, message_channel: trio.MemoryReceiveChannel):
     ws: trio_websocket.WebSocketConnection
     async with open_websocket_url(url) as ws:
-        async for message in messages_channel:
+        async for message in message_channel:
             await ws.send_message(message)
 
 
-async def run_bus(messages_channel: trio.MemorySendChannel, bus_id, route, skip_coordinates=0, refresh_timeout=1):
-    async with messages_channel:
+async def run_bus(message_channel: trio.MemorySendChannel, bus_id, route, skip_coordinates=0, refresh_timeout=1):
+    async with message_channel:
         coordinates = islice(cycle(route['coordinates']), skip_coordinates, None)
         bus_data = {"busId": bus_id, "route": route['name']}
         for coordinate in coordinates:
             message = json.dumps(dict(bus_data, lat=coordinate[0], lng=coordinate[1]))
-            await messages_channel.send(message)
+            await message_channel.send(message)
             await trio.sleep(refresh_timeout)
 
 
@@ -60,17 +62,6 @@ def load_routes(directory_path='routes'):
             filepath = os.path.join(directory_path, filename)
             with open(filepath, 'r', encoding='utf8') as file:
                 yield json.load(file)
-
-
-def make_uniq_bus_id(existing_ids, route_name):
-    i = 0
-    bus_id = f"{route_name}-{i}"
-    while bus_id in existing_ids:
-        bus_id = f"{route_name}-{i}"
-        i += 1
-
-    existing_ids.add(bus_id)
-    return bus_id
 
 
 def generate_bus_id(route_id, bus_index, prefix):
