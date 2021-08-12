@@ -1,12 +1,13 @@
 import contextlib
-from dataclasses import asdict
-from dataclasses import dataclass
 from functools import partial
 import json
 import logging
 import os
 
 import asyncclick as click
+from pydantic import BaseModel
+from pydantic import ValidationError
+from pydantic import validator
 import trio
 from trio_websocket import ConnectionClosed
 from trio_websocket import serve_websocket
@@ -24,6 +25,9 @@ class WebsocketMessageParseError(Exception):
         self.error = error
         super().__init__(*args)
 
+    def __str__(self):
+        return str(self.error)
+
 
 @contextlib.asynccontextmanager
 async def notify_client_about_message_format_error(ws: WebSocketConnection):
@@ -33,40 +37,40 @@ async def notify_client_about_message_format_error(ws: WebSocketConnection):
         await ws.send_message(json.dumps({"errors": [ex.error], "msgType": "Errors"}))
 
 
-@dataclass
-class Bus:
+class Bus(BaseModel):
     lat: float
     lng: float
     busId: str
     route: str
 
 
-@dataclass
-class WindowBounds:
-    south_lat: float = 0
-    north_lat: float = -1
-    west_lng: float = 0
-    east_lng: float = -1
+class WindowBounds(BaseModel):
+    south_lat: float
+    north_lat: float
+    west_lng: float
+    east_lng: float
+
+    @classmethod
+    def make_empty(cls):
+        return cls(south_lat=0, north_lat=-1, west_lng=0, east_lng=-1)
 
     def is_inside(self, bus: Bus):
-        try:
-            return (
-                self.south_lat <= bus.lat <= self.north_lat
-                and self.west_lng <= bus.lng <= self.east_lng
-            )
-        except TypeError as ex:
-            logger.exception('WindowBounds.is_inside %r', ex)
-
-        return False
+        return (
+            self.south_lat <= bus.lat <= self.north_lat
+            and self.west_lng <= bus.lng <= self.east_lng
+        )
 
     def is_real(self):
         return self.south_lat < self.north_lat and self.west_lng < self.east_lng
 
     @staticmethod
-    def validate_new_bounds(*, south_lat, north_lat, west_lng, east_lng):
-        args = [south_lat, north_lat, west_lng, east_lng]
-        assert all(map(lambda arg: isinstance(arg, (float, int)), args))
-        assert WindowBounds(*args).is_real()
+    def validate_new_bounds(message: dict) -> "WindowBounds":
+        try:
+            return WindowBoundsMessage.validate(message).data
+        except ValidationError as ex:
+            raise WebsocketMessageParseError(
+                f"Wrong format of newBounds message: {str(ex)}"
+            )
 
     def update(self, *, south_lat, north_lat, west_lng, east_lng):
         self.__init__(
@@ -77,10 +81,29 @@ class WindowBounds:
         )
 
 
+class WindowBoundsMessage(BaseModel):
+    msgType: str
+    data: WindowBounds
+
+    @validator("data", pre=True)
+    @classmethod
+    def validate_data(cls, value: dict):
+        if not WindowBounds.validate(value).is_real():
+            raise ValueError('newBounds.data is not real')
+
+        unwanted_felds = value.keys() - WindowBounds.__fields__.keys()
+        if unwanted_felds:
+            raise ValueError(f'newBounds.data has unwanted fields {unwanted_felds!r}')
+
+        if not WindowBounds.validate(value).is_real():
+            raise ValueError('newBounds.data is not real')
+        return value
+
+
 @async_suppress(ConnectionClosed)
 async def serve_outcome(request: WebSocketRequest):
     ws: WebSocketConnection = await request.accept()
-    bounds = WindowBounds()
+    bounds = WindowBounds.make_empty()
 
     async with trio.open_nursery() as nursery:
         nursery.start_soon(listen_browser, ws, bounds)
@@ -93,7 +116,7 @@ async def talk_to_browser(ws: WebSocketConnection, bounds: WindowBounds):
             message_data = {
                 "msgType": "Buses",
                 "buses": [
-                    asdict(bus)
+                    bus.dict()
                     for bus in BUSES.values()
                     if (bounds.is_inside(bus))
                 ]
@@ -123,11 +146,13 @@ async def listen_browser(ws: WebSocketConnection, bounds: WindowBounds):
                 #  {"msgType":"newBounds",
                 #   "data":{"south_lat":55.7256116937982,"north_lat":55.77435239625299,
                 #           "west_lng":37.54019737243653,"east_lng":37.65984535217286}}
-                try:
-                    bounds.validate_new_bounds(**message['data'])
-                    bounds.update(**message['data'])
-                except (TypeError, AssertionError):
-                    raise WebsocketMessageParseError("Wrong format of newBounds message")
+                new_bounds = bounds.validate_new_bounds(message)
+                bounds.update(
+                    south_lat=new_bounds.south_lat,
+                    north_lat=new_bounds.north_lat,
+                    west_lng=new_bounds.west_lng,
+                    east_lng=new_bounds.east_lng
+                )
 
             logger.debug('%r', message)
 
@@ -146,12 +171,11 @@ async def serve_income(request: WebSocketRequest):
 
             try:
                 bus = Bus(**bus_data)
-                assert isinstance(bus.lng, (int, float)) and isinstance(bus.lat, (int, float))
-            except (TypeError, AssertionError):
+            except (TypeError, AssertionError, ValidationError):
                 raise WebsocketMessageParseError('Requires busId: str, lat: float, lng: float and route: str specified')
 
             BUSES[bus.busId] = bus
-            logger.debug('%r', asdict(bus))
+            logger.debug('%r', bus.dict())
 
 
 @click.command()
